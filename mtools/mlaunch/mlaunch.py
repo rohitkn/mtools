@@ -31,7 +31,20 @@ def pingMongoDS(host, interval=1, timeout=30):
             return True
         except (ConnectionFailure, AutoReconnect) as e:
             time.sleep(interval)
-
+            
+def _stopMongoDaemon(host, interval=1, timeout=10):
+    # this can stop a mongos, mongod (config server, arbiter)
+    con = None
+    startTime = time.time()
+    while not con:
+        if (time.time() - startTime) > timeout:
+            return False
+        try:
+            con = Connection(host)
+            con['admin'].command({'shutdown': 1})
+            return True
+        except (ConnectionFailure, AutoReconnect) as e:
+            time.sleep(interval)
 
 class MLaunchTool(BaseCmdLineTool):
 
@@ -49,10 +62,12 @@ class MLaunchTool(BaseCmdLineTool):
         me_group.add_argument('--single', action='store_true', help='creates a single stand-alone mongod instance')
         me_group.add_argument('--replicaset', action='store_true', help='creates replica set with several mongod instances')
         me_group.add_argument('--restart', '--restore', action='store_true', help='restarts a previously launched existing configuration from the data directory.')
+        me_group.add_argument('--stop', action='store_true', help='stop all previously launched mongo(d|s) instances in a cluster. Reuse launched --dir')
 
         # replica set arguments
         self.argparser.add_argument('--nodes', action='store', metavar='NUM', type=int, default=3, help='adds NUM data nodes to replica set (requires --replicaset, default=3)')
         self.argparser.add_argument('--arbiter', action='store_true', default=False, help='adds arbiter to replica set (requires --replicaset)')
+        self.argparser.add_argument('--nochaining', action='store_true', default=False, help='disables chaining for syncing in each replicaset')
         self.argparser.add_argument('--name', action='store', metavar='NAME', default='replset', help='name for replica set (default=replset)')
         
         # sharded clusters
@@ -66,6 +81,8 @@ class MLaunchTool(BaseCmdLineTool):
         self.argparser.add_argument('--port', action='store', type=int, default=27017, help='port for mongod, start of port range in case of replica set or shards (default=27017)')
         self.argparser.add_argument('--authentication', action='store_true', default=False, help='enable authentication and create a key file and admin user (admin/mypassword)')
         self.argparser.add_argument('--binarypath', action='store', default=None, metavar='PATH', help='search for mongod/s binaries in the specified PATH.')
+        
+        self.argparser.add_argument('--cleanup', action='store_true', default=False, help='stops mongod instances and deletes folders for instances on the port range.')
 
         self.hostname = socket.gethostname()
 
@@ -76,6 +93,9 @@ class MLaunchTool(BaseCmdLineTool):
         # load or store parameters
         if self.args['restart']:
             self.load_parameters()
+        elif self.args['stop']:
+            self.load_parameters()
+            self.args['stop'] = True
         else:
             self.store_parameters()
 
@@ -87,12 +107,15 @@ class MLaunchTool(BaseCmdLineTool):
             os.system('openssl rand -base64 753 > %s/keyfile'%self.args['dir'])
             os.system('chmod 600 %s/keyfile'%self.args['dir'])
 
-        if self.args['sharded']:
-            self._launchSharded()
-        elif self.args['single']:
-            self._launchSingle(self.args['dir'], self.args['port'])
-        elif self.args['replicaset']:
-            self._launchReplSet(self.args['dir'], self.args['port'], self.args['name'])
+        if self.args['stop']:
+            self._stopAll(self.args['dir'])
+        else:
+            if self.args['sharded']:
+                self._launchSharded()
+            elif self.args['single']:
+                self._launchSingle(self.args['dir'], self.args['port'])
+            elif self.args['replicaset']:
+                self._launchReplSet(self.args['dir'], self.args['port'], self.args['name'])
 
 
     def convert_u2b(self, obj):
@@ -270,6 +293,36 @@ class MLaunchTool(BaseCmdLineTool):
 
             time.sleep(1)
 
+    def _stopAll(self, basedir):
+        threads=[]
+        if basedir is not None:
+            high_port = self.args['port']
+            if self.args['single']:
+                nodes_per_shard = 1
+            elif self.args['replicaset']:
+                nodes_per_shard = self.args['nodes']
+                if(self.args['arbiter']):
+                    nodes_per_shard += 1 
+                
+            if self.args['sharded'] is not None:
+                high_port += self.args['mongos']
+                high_port += self.args['config']
+                if(len(self.args['sharded']) == 1):
+                    high_port += int(self.args['sharded'][0]) * nodes_per_shard
+                else:
+                    high_port += len(self.args['sharded']) * nodes_per_shard
+        else:
+            pass
+        
+        for i in range(self.args['port'], high_port + 1):
+                threads.append(threading.Thread(target=_stopMongoDaemon, args=('%s:%i'%('localhost',i), 1.0, 10 )))
+                
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
 
     def _launchReplSet(self, basedir, portstart, name):
         threads = []
@@ -299,7 +352,11 @@ class MLaunchTool(BaseCmdLineTool):
                 print "waiting for mongod at %s to start up..."%host
 
             print "arbiter at %s running." % host
-
+        
+        # disable chaining if asked for
+        if self.args['nochaining']:
+            configDoc['settings'] = {'chainingAllowed' : False}
+        
         for thread in threads:
             thread.start()
 
