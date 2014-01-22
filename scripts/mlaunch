@@ -43,6 +43,8 @@ def _stopMongoDaemon(host, interval=1, timeout=10):
             con = Connection(host)
             con['admin'].command({'shutdown': 1})
             return True
+        except OperationFailure as of:
+            print 'shut down error on %s, reason: %s'%(host,of) 
         except (ConnectionFailure, AutoReconnect) as e:
             time.sleep(interval)
 
@@ -81,11 +83,12 @@ class MLaunchTool(BaseCmdLineTool):
         self.argparser.add_argument('--port', action='store', type=int, default=27017, help='port for mongod, start of port range in case of replica set or shards (default=27017)')
         self.argparser.add_argument('--authentication', action='store_true', default=False, help='enable authentication and create a key file and admin user (admin/mypassword)')
         self.argparser.add_argument('--binarypath', action='store', default=None, metavar='PATH', help='search for mongod/s binaries in the specified PATH.')
-        
-        self.argparser.add_argument('--cleanup', action='store_true', default=False, help='stops mongod instances and deletes folders for instances on the port range.')
 
         self.hostname = socket.gethostname()
 
+        # because --stop needs to load old parameters, 
+        # it also needs to be able to add verbose if it wasn't there on launch
+        self.verbose = False
 
     def run(self, arguments=None):
         BaseCmdLineTool.run(self, arguments, get_unknowns=True)
@@ -94,6 +97,8 @@ class MLaunchTool(BaseCmdLineTool):
         if self.args['restart']:
             self.load_parameters()
         elif self.args['stop']:
+            if self.args['verbose']:
+                self.verbose = True
             self.load_parameters()
             self.args['stop'] = True
         else:
@@ -295,34 +300,41 @@ class MLaunchTool(BaseCmdLineTool):
 
     def _stopAll(self, basedir):
         threads=[]
+        nodes_per_replSet = 1
         if basedir is not None:
             high_port = self.args['port']
-            if self.args['single']:
-                nodes_per_shard = 1
-            elif self.args['replicaset']:
-                nodes_per_shard = self.args['nodes']
+            shards = self.args['sharded'] #this is an array 
+            
+            if self.args['replicaset']:
+                nodes_per_replSet = self.args['nodes']
                 if(self.args['arbiter']):
-                    nodes_per_shard += 1 
-                
-            if self.args['sharded'] is not None:
+                    nodes_per_replSet += 1 
+            #else (single is covered by setting nodes_per_replSet to 1)
+            
+            if shards is not None:
                 high_port += self.args['mongos']
                 high_port += self.args['config']
-                if(len(self.args['sharded']) == 1):
-                    high_port += int(self.args['sharded'][0]) * nodes_per_shard
+                if(len(shards) == 1):
+                    high_port += int(shards[0]) * nodes_per_replSet
                 else:
-                    high_port += len(self.args['sharded']) * nodes_per_shard
+                    high_port += len(shards) * nodes_per_replSet
+            else:
+                high_port += nodes_per_replSet
         else:
-            pass
-        
+            print "can't stop mongods, bad directory: %s."%basedir
+            raise SystemExit
+
         for i in range(self.args['port'], high_port + 1):
-                threads.append(threading.Thread(target=_stopMongoDaemon, args=('%s:%i'%('localhost',i), 1.0, 10 )))
-                
+            # we use localhost because otherwise we'll get an error for not connecting to localhost
+            threads.append(threading.Thread(target=_stopMongoDaemon, args=('%s:%i'%('localhost',i), 1.0, 10 )))
+            if self.args['verbose']:
+                print 'server on port %i will be shut off'%i
+
         for thread in threads:
             thread.start()
 
         for thread in threads:
             thread.join()
-
 
     def _launchReplSet(self, basedir, portstart, name):
         threads = []
